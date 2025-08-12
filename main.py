@@ -4,50 +4,53 @@ from operator import add
 def init_spark():
     return SparkSession.builder.getOrCreate()
 
-def query_top5_compounds_with_genes(spark, use_metaedge=True):
+def query_top5_compounds_with_genes(spark):
     nodes_df = (spark.read.option("header", True).option("delimiter","\t").csv("/Users/jaismeenkaur/CSCI-49376-Project2/nodes.tsv")
              .select("id", "name","kind"))
     edges_df = (spark.read.option("header", True).option("delimiter","\t").csv("/Users/jaismeenkaur/CSCI-49376-Project2/edges.tsv")
              .select("source","target","metaedge"))
 
-
+    #only keep nodes with kind == compound
     compounds_df = nodes_df.filter(F.col("kind")=="Compound").select(F.col("id").alias("compound_id"))
-
+    
+    #takes each Row r from the RDD and transforms it into a tuple containing only the source and target
     edges_by_src = edges_df.rdd.map(lambda r: (r["source"], r["target"]))  
 
     compounds_rdd = compounds_df.rdd.map(lambda r: (r["compound_id"], None))      
 
 
-    # (compound_id, neighbor)
+    # keep only edges where 'source' is a compound (compound_id, neighbor)
     compound_edges_rdd = edges_by_src.join(compounds_rdd).map(lambda kv: (kv[0], kv[1][0]))
 
-    # Map to (compound_id, neighbor_type)
+    # Helper function, gets neighbor as 'gene', 'disease', or None
     def neighbor_type(neighbor):
         if neighbor.startswith("Gene"):    
             return "gene"
         if neighbor.startswith("Disease"): 
             return "disease"
         return None
-
+    # Map to (compound_id, neighbor_type) and remove non-gene/disease neighbors
     typed_rdd = (compound_edges_rdd
                  .map(lambda x: (x[0], neighbor_type(x[1])))
                  .filter(lambda x: x[1] is not None)) 
 
     # Combiner step
-
+    #create key value pair with count 1 for each occurence and then reduceByKey combines the all identical keys
     by_type_counts = (typed_rdd.map(lambda x: ((x[0], x[1]), 1)).reduceByKey(add))  
 
     # Reducer step
+    #seprates the count by type
     def seq(acc, kv):
         typ, cnt = kv
         if typ == "gene":    
             return (acc[0] + cnt, acc[1])
         else:                
             return (acc[0], acc[1] + cnt)
-
+    #adds the partial counts of genes and diseases 
     def comb(a, b): 
         return (a[0]+b[0], a[1]+b[1])
 
+    # aggregate per compound: (compound_id, (gene_count, disease_count))
     per_compound = (by_type_counts.map(lambda kv: (kv[0][0], (kv[0][1], kv[1]))).aggregateByKey((0,0), seq, comb))           
 
     
@@ -69,7 +72,7 @@ def query2(spark,use_metaedge=True):
     nodes_df = spark.read.option("delimiter", "\t").option("header", True).csv("/Users/jaismeenkaur/CSCI-49376-Project2/nodes.tsv").select("id","name", "kind")
     edges_df = spark.read.option("delimiter", "\t").option("header", True).csv("/Users/jaismeenkaur/CSCI-49376-Project2/edges.tsv").select("source", "target", "metaedge")
    
-       # Filter
+       # Filter only compound to disease metaedges
     if use_metaedge and "metaedge" in edges_df.columns:
         cd_src = edges_df.filter(F.col("metaedge").isin("CtD", "CpD"))
     else:
@@ -80,24 +83,26 @@ def query2(spark,use_metaedge=True):
 
     diseases = nodes_df.filter(F.col("kind") == "Disease") \
                        .select(F.col("id").alias("disease_id"),"name")
-
+                       
+    # filtered edges with disease nodes 
     dc_df = (cd_src.join(diseases, cd_src.target == diseases.disease_id, "inner")
                   .select(F.col("disease_id"), F.col("source").alias("compound_id"))
                   .dropDuplicates()) 
 
- # MapReduce (pairs) 
+    # MapReduce (pairs) 
+     #convert to rdd
     rdd = dc_df.rdd  # (disease_id, compound_id)
 
 
-    # per-disease counts
+    # per-disease counts, Count how many compounds each disease has
     per_disease_counts = (rdd
         .map(lambda r: (r["disease_id"], 1))
-        .reduceByKey(add))   # (disease_id, drugs_per_disease)
+        .reduceByKey(add)) 
 
-
+    #Count how many diseases have the same number of compounds
     counts = (per_disease_counts
-        .map(lambda kv: (kv[1], 1))     # (drugs_per_disease, 1)
-        .reduceByKey(add))              # (drugs_per_disease, num_diseases)
+        .map(lambda kv: (kv[1], 1))    
+        .reduceByKey(add))            
 
     # top-5 
     top5 = counts.takeOrdered(5, key=lambda kv: (-kv[1], kv[0]))
@@ -110,12 +115,14 @@ def query_compound_names_from_top5(spark):
              .select("id", "name","kind"))
     edges_df = (spark.read.option("header", True).option("delimiter","\t").csv("/Users/jaismeenkaur/CSCI-49376-Project2/edges.tsv")
              .select("source","target","metaedge"))
+   
     top5_compounds = query_top5_compounds_with_genes(spark)
 
     result = top5_compounds.join(nodes_df.select("id", "name"), top5_compounds.compound_id == nodes_df.id) \
                            .select("name", "compound_id", "gene", "disease") \
                            .orderBy(F.desc("gene"))
     return result.select("name", "gene")
+
 def main():
     spark = init_spark()
     print("\nSelect a query to run:")
